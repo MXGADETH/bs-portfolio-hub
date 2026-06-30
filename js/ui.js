@@ -271,7 +271,7 @@ export function renderPortfolios(portfolios, filters = { keyword: "", university
             <footer class="mt-16 bg-[#7A1C1C] text-white rounded-3xl border-b-4 border-[#D4AF37] p-6 shadow-xl select-none">
                 <div class="flex flex-col sm:flex-row items-center justify-center gap-5">
                     <div class="w-16 h-16 bg-white rounded-full border-2 border-[#D4AF37] overflow-hidden flex items-center justify-center shrink-0">
-                        <img src="assets/logo/CM.png" alt="ตราแผนการเรียน" class="w-full h-full object-cover scale-110" onerror="this.src='https://placehold.co/100x100/7A1C1C/FFFFFF?text=CM'">
+                        <img src="assets/logo/CM.jpg" alt="ตราแผนการเรียน" class="w-full h-full object-cover scale-110" onerror="this.src='https://placehold.co/100x100/7A1C1C/FFFFFF?text=CM'">
                     </div>
                     <div class="hidden sm:block h-12 w-[1.5px] bg-gradient-to-b from-amber-400/60 via-amber-200/20 to-transparent"></div>
                     <div class="text-center sm:text-left flex flex-col justify-center">
