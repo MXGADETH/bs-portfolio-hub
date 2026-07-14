@@ -1,0 +1,384 @@
+// ========================================================================================
+// 🛡️ Google Apps Script - ระบบจัดการสมาชิก พอร์ตโฟลิโอ และ Logs (ฉบับเสถียร ซ่อมบั๊ก ReferenceError)
+// ========================================================================================
+
+function doPost(e) {
+  var lock = LockService.getScriptLock();
+  try {
+    // เพิ่มเวลา Lock เป็น 30 วินาที เพื่อรองรับไฟล์ขนาดใหญ่
+    lock.waitLock(30000); 
+    
+    if (!e || !e.postData || !e.postData.contents) {
+      return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "ไม่พบข้อมูลที่ส่งมาจากระบบ" })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var json = JSON.parse(e.postData.contents);
+    var action = json.action;
+    var response = { status: "success", message: "ดำเนินการสำเร็จ" };
+
+    var userEmail = json.adminEmail || json.sender || "Guest/Anonymous";
+    var userIp = json.ip || "";
+
+    // 📢 1. ระบบประกาศข่าวสาร
+    if (action === "saveAnnouncement") {
+      if (!validateAdminRole(ss, userEmail)) return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "คุณไม่มีสิทธิ์จัดการประกาศระบบ!" })).setMimeType(ContentService.MimeType.JSON);
+      var sheet = ss.getSheetByName("Announcements") || ss.insertSheet("Announcements");
+      if (sheet.getLastRow() > 1) sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).clearContent();
+      sheet.appendRow([json.announcement, getFormattedDate()]);
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 🔑 2. ระบบปรับสิทธิ์สมาชิก
+    else if (action === "updateUserRole") {
+      if (!validateSuperAdminRole(ss, userEmail)) return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "สิทธิ์ไม่เพียงพอ!" })).setMimeType(ContentService.MimeType.JSON);
+      var sheet = ss.getSheetByName("Users") || ss.getSheetByName("users");
+      var data = sheet.getDataRange().getValues();
+      var found = false;
+      for (var i = 1; i < data.length; i++) {
+        if (data[i][0] === json.username || data[i][1] === json.username) { sheet.getRange(i + 1, 3).setValue(json.role); found = true; break; }
+      }
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // 🗂️ 3. ระบบจัดการฐานข้อมูลพอร์ตโฟลิโอ
+    var sheet = ss.getSheetByName("Portfolios") || ss.getSheetByName("portfolios");
+    
+    if (action === "create" || action === "update") {
+      // อัปโหลดไฟล์
+      var imageUrl = uploadBase64FileToDrive(json.image_base64, json.fullname + "_cover_" + new Date().getTime(), "image/png", json.image_url_old);
+      var pdfUrl = uploadBase64FileToDrive(json.pdf_base64, json.fullname + "_portfolio_" + new Date().getTime(), "application/pdf", json.port_link_old);
+
+      // ตรวจสอบความถูกต้องของไฟล์ PDF
+      if (action === "create" && pdfUrl.indexOf("_error_pdf") !== -1) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "ไฟล์ PDF อัปโหลดไม่สำเร็จ" })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+      if (action === "create") {
+        sheet.appendRow([getFormattedDate(), json.fullname, json.nickname, json.major, json.gpax, json.university, json.faculty, json.sender, json.round, json.title, "", json.intro, pdfUrl, "pending", imageUrl || "https://placehold.co/600x400/7A1C1C/FFFFFF?text=BS+Portfolio", 0, 0]);
+        writeActivityLog(userEmail, "CREATE_PORTFOLIO", "ยื่นส่งพอร์ต: " + json.fullname, userIp);
+      } else {
+        var rows = sheet.getDataRange().getValues();
+        for (var i = 1; i < rows.length; i++) {
+          if (rows[i][7] === json.sender && rows[i][9] === json.title_old && rows[i][1] === json.fullname) {
+            sheet.getRange(i + 1, 2, 1, 16).setValues([[json.fullname, json.nickname, json.major, json.gpax, json.university, json.faculty, json.sender, json.round, json.title, "", json.intro, pdfUrl, "pending", imageUrl, rows[i][15], rows[i][16]]]);
+            break;
+          }
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+    
+    // 🔹 เคสอนุมัติพอร์ตโฟลิโอ หรือปฏิเสธเพื่อลบแถวข้อมูลออก (ลบรูปปก + ลบไฟล์ PDF พร้อมกัน)
+    else if (action === "approve") {
+      var rows = sheet.getDataRange().getValues();
+      var found = false;
+
+      for (var i = rows.length - 1; i >= 1; i--) {
+        var dbFullname = rows[i][1].toString().trim();
+        var dbTitle = rows[i][9].toString().trim();
+        var reqFullname = json.fullname.toString().trim();
+        var reqTitle = json.title.toString().trim();
+
+        if (dbFullname === reqFullname && dbTitle === reqTitle) {
+          found = true;
+          
+          if (json.isApprove === true) { 
+            sheet.getRange(i + 1, 14).setValue("approved");
+            writeActivityLog(userEmail, "APPROVE_PORTFOLIO", "อนุมัติ: " + reqFullname + " (" + reqTitle + ")", userIp);
+          } else {
+            var filesToTrash = [rows[i][14], rows[i][12]]; 
+            
+            filesToTrash.forEach(function(url) {
+              try {
+                var urlStr = url ? url.toString().trim() : "";
+                if (urlStr && urlStr.indexOf("googleusercontent.com/d/") !== -1) {
+                  var fileId = urlStr.split("googleusercontent.com/d/")[1];
+                  if (fileId) {
+                    DriveApp.getFileById(fileId).setTrashed(true);
+                  }
+                }
+              } catch(e) {
+                Logger.log("ข้ามการลบไฟล์: " + e.toString());
+              }
+            });
+
+            sheet.deleteRow(i + 1);
+            writeActivityLog(userEmail, "REJECT_PORTFOLIO", "ลบพอร์ตและไฟล์มีเดียทั้งหมด: " + reqFullname + " (" + reqTitle + ")", userIp);
+          }
+          break;
+        }
+      }
+
+      if (!found) {
+        return ContentService.createTextOutput(JSON.stringify({ 
+          status: "error", 
+          message: "❌ ไม่พบแถวข้อมูลผลงานที่ต้องการตรวจสอบบนระบบคลาวด์" 
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // ----------------------------------------------------------------
+    // ❤️ ฟีเจอร์: ระบบกด/ยกเลิกหัวใจ แบบสลับสถานะ (Like Toggle)
+    // ----------------------------------------------------------------
+    else if (action === "toggleLike") {
+      var rows = sheet.getDataRange().getValues();
+      var found = false;
+      
+      var favSheet = ss.getSheetByName("Favorites") || ss.getSheetByName("favorites");
+      if (!favSheet) favSheet = ss.insertSheet("Favorites");
+      var favRows = favSheet.getDataRange().getValues();
+      
+      var hasLikedBefore = false;
+      var likeRecordRow = -1;
+      var username = json.username || ""; 
+
+      for (var k = 1; k < favRows.length; k++) {
+        if (favRows[k][0] === username && favRows[k][1] === json.fullname && favRows[k][2] === json.title && favRows[k][3] === "like_action") {
+          hasLikedBefore = true;
+          likeRecordRow = k + 1;
+          break;
+        }
+      }
+
+      for (var i = 1; i < rows.length; i++) {
+        if (rows[i][1].toString().trim() === json.fullname.toString().trim() && 
+            rows[i][9].toString().trim() === json.title.toString().trim()) {
+          
+          var currentLikes = Number(rows[i][16] || 0);
+          
+          if (hasLikedBefore) {
+            var newLikes = Math.max(0, currentLikes - 1);
+            sheet.getRange(i + 1, 17).setValue(newLikes);
+            favSheet.deleteRow(likeRecordRow); 
+            response.isLiked = false;
+            response.currentLikes = newLikes;
+          } else {
+            var newLikes = currentLikes + 1;
+            sheet.getRange(i + 1, 17).setValue(newLikes);
+            favSheet.appendRow([username, json.fullname, json.title, "like_action"]); 
+            response.isLiked = true;
+            response.currentLikes = newLikes;
+          }
+          found = true;
+          break;
+        }
+      }
+      
+      if (!found) return ContentService.createTextOutput(JSON.stringify({status: "error", message: "ไม่พบผลงาน"})).setMimeType(ContentService.MimeType.JSON);
+      response.status = "success";
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    // ----------------------------------------------------------------
+    // ⭐ ฟีเจอร์: ระบบบันทึก / ยกเลิก พอร์ตชื่นชอบ (Toggle Favorite)
+    // ----------------------------------------------------------------
+    else if (action === "toggleFavorite") {
+      var favSheet = ss.getSheetByName("Favorites") || ss.getSheetByName("favorites");
+      if (!favSheet) favSheet = ss.insertSheet("Favorites");
+      
+      var favRows = favSheet.getDataRange().getValues();
+      var isExist = false;
+      var targetRow = -1;
+      
+      for (var j = 1; j < favRows.length; j++) {
+        if (favRows[j][0] === json.username && 
+            favRows[j][1] === json.fullname && 
+            favRows[j][2] === json.title &&
+            favRows[j][3] === "fav_action") { 
+          isExist = true;
+          targetRow = j + 1;
+          break;
+        }
+      }
+      
+      if (isExist) {
+        favSheet.deleteRow(targetRow);
+        response.message = "ยกเลิกการบันทึกชื่นชอบแล้ว";
+        response.isFavorite = false;
+      } else {
+        favSheet.appendRow([json.username, json.fullname, json.title, "fav_action"]);
+        response.message = "บันทึกเป็นพอร์ตชื่นชอบเรียบร้อย";
+        response.isFavorite = true;
+      }
+      return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    else if (action === "incrementView") {
+      var rows = sheet.getDataRange().getValues();
+      var found = false;
+      
+      // อ้างอิง index ตามโครงสร้างเดิม
+      var fullnameIndex = 1;
+      var titleIndex = 9;
+      var viewIndex = 15;
+
+      for (var i = 1; i < rows.length; i++) {
+        // ใช้ .trim().toLowerCase() เพื่อความชัวร์ 100%
+        if (String(rows[i][fullnameIndex]).trim().toLowerCase() === String(json.fullname).trim().toLowerCase() && 
+            String(rows[i][titleIndex]).trim().toLowerCase() === String(json.title).trim().toLowerCase()) {
+          
+          var currentViews = parseInt(rows[i][viewIndex]) || 0;
+          sheet.getRange(i + 1, viewIndex + 1).setValue(currentViews + 1);
+          found = true;
+          break;
+        }
+      }
+      
+      if (found) {
+        return ContentService.createTextOutput(JSON.stringify({ status: "success" })).setMimeType(ContentService.MimeType.JSON);
+      } else {
+        return ContentService.createTextOutput(JSON.stringify({ status: "error", message: "ไม่พบพอร์ตสำหรับอัปเดตยอดวิว" })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // กรณี Action อื่นๆ ที่ไม่เข้าเงื่อนไข ให้ตอบกลับด้วย response พื้นฐาน
+    return ContentService.createTextOutput(JSON.stringify(response)).setMimeType(ContentService.MimeType.JSON);
+    
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ status: "error", message: error.toString() })).setMimeType(ContentService.MimeType.JSON);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// ----------------------------------------------------------------
+// 📢 4. ฟังก์ชันดึงข้อมูลพอร์ตและกิจกรรม (READ DATABASE via GET)
+// ----------------------------------------------------------------
+function doGet(e) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var portfolios = [], logsData = [], favoritesData = [];
+  
+  var pSheet = ss.getSheetByName("Portfolios") || ss.getSheetByName("portfolios");
+  if (pSheet) {
+    var data = pSheet.getDataRange().getValues();
+    for (var i = 1; i < data.length; i++) {
+      portfolios.push({ 
+        fullname: data[i][1], 
+        nickname: data[i][2], 
+        major: data[i][3], 
+        gpax: data[i][4], 
+        university: data[i][5], 
+        faculty: data[i][6], 
+        sender: data[i][7], 
+        round: data[i][8], 
+        title: data[i][9], 
+        intro: data[i][11], 
+        port_link: data[i][12], 
+        status: data[i][13], 
+        image_url: data[i][14], 
+        views: data[i][15],
+        likes: data[i][16] || 0
+      });
+    }
+  }
+
+  var favSheet = ss.getSheetByName("Favorites") || ss.getSheetByName("favorites");
+  if (favSheet) {
+    var favValues = favSheet.getDataRange().getValues();
+    for (var k = 1; k < favValues.length; k++) {
+      favoritesData.push({
+        username: favValues[k][0],
+        fullname: favValues[k][1],
+        title: favValues[k][2],
+        action_type: favValues[k][3] || "fav_action"
+      });
+    }
+  }
+
+  var lSheet = ss.getSheetByName("logs") || ss.getSheetByName("Logs");
+  if (lSheet) {
+    var logValues = lSheet.getDataRange().getValues();
+    for (var j = logValues.length - 1; j >= 1; j--) {
+      logsData.push({ 
+        timestamp: logValues[j][0], user: logValues[j][1], action: logValues[j][2], details: logValues[j][3] 
+      });
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify({ 
+    portfolios: portfolios, 
+    logs: logsData, 
+    favorites: favoritesData 
+  })).setMimeType(ContentService.MimeType.JSON);
+}
+
+function uploadBase64FileToDrive(base64Data, filename, mimeType, defaultUrl) {
+  // เพิ่มการเช็คว่าข้อมูลที่ได้รับมาไม่ใช่แค่ string ว่างๆ
+  if (!base64Data || base64Data === "" || base64Data === "undefined" || base64Data.length < 100) { 
+    return defaultUrl || "";
+  }
+  try {
+    var FOLDER_ID = "1YMvBRmwW8z_UErV81RDEkeUfvgg5XAhH";
+    var splitData = base64Data.indexOf(",") != -1 ? base64Data.split(",") : ["", base64Data];
+    
+    // แปลงข้อมูล Base64 เป็น Blob
+    var bytes = Utilities.base64Decode(splitData[1]);
+    var blob = Utilities.newBlob(bytes, mimeType, filename);
+    
+    var file = DriveApp.getFolderById(FOLDER_ID).createFile(blob);
+
+    // 🎯 แยก setSharing ออกมาเป็น try/catch ของตัวเอง
+    try {
+      file.setSharing(DriveApp.Access.ANYONE, DriveApp.Permission.VIEW);
+    } catch (shareErr) {
+      Logger.log("⚠️ ไม่สามารถตั้งค่าแชร์ไฟล์แบบสาธารณะได้: " + shareErr.toString());
+    }
+
+    // 🎯 ถ้าเป็นไฟล์รูปภาพ (image/png, image/jpeg) ให้ใช้ลิงก์แสดงผลตรง
+    // ถ้าเป็นไฟล์ PDF ให้ใช้ลิงก์ปกติเพื่อความปลอดภัย
+    if (mimeType.indexOf("image") !== -1) {
+      return "https://lh3.googleusercontent.com/d/" + file.getId();
+    } else {
+      return "https://drive.google.com/file/d/" + file.getId() + "/view";
+    }
+
+  } catch (err) {
+    Logger.log("Error: " + err.toString());
+    return "_error_pdf"; // ส่งค่านี้กลับเพื่อให้ระบบแจ้งเตือนว่าอัปโหลดไม่ผ่าน
+  }
+}
+
+function writeActivityLog(userEmail, action, details, ip) {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    var logSheet = ss.getSheetByName("logs") || ss.getSheetByName("Logs");
+    if (!logSheet) {
+      logSheet = ss.insertSheet("logs");
+      logSheet.appendRow(["timestamp", "user", "action", "details", "ip"]);
+    }
+    logSheet.appendRow([getFormattedDate(), userEmail, action, details, ip || "Unknown"]);
+  } catch (error) {
+    Logger.log("Log Error: " + error.toString());
+  }
+}
+
+function getFormattedDate() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+}
+
+// 🎯 ฟังก์ชันตรวจสอบสิทธิ์ (คงฟังก์ชันเดิมไว้ให้ทำงานร่วมกับตาราง Users)
+function validateAdminRole(ss, email) {
+  var sheet = ss.getSheetByName("Users") || ss.getSheetByName("users");
+  if (!sheet) return false;
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) {
+    if (values[i][3] === email) {
+      var role = values[i][4];
+      return (role === 'admin' || role === 'superadmin');
+    }
+  }
+  return false;
+}
+
+function validateSuperAdminRole(ss, email) {
+  var sheet = ss.getSheetByName("Users") || ss.getSheetByName("users");
+  if (!sheet) return false;
+  var values = sheet.getDataRange().getValues();
+  for (var i = 1; i < values.length; i++) {
+    if (values[i][3] === email) {
+      return (values[i][4] === 'superadmin');
+    }
+  }
+  return false;
+}
